@@ -165,6 +165,22 @@ describe("restoreConfigFromBase", () => {
     );
   });
 
+  test("does not dereference a PR-authored symlink that escapes the repository into .claude-pr", () => {
+    const secretPath = join(tempDir, "host-secret.txt");
+    writeFileSync(secretPath, "super secret host content\n");
+
+    // The PR head (untrusted) adds a symlink pointing outside the repo.
+    symlinkRepoFile(".claude/leak", secretPath);
+    git(["add", ".claude/leak"]);
+    git(["commit", "-m", "pr adds a symlink escaping the repository"]);
+
+    restoreConfigFromBase("main");
+
+    expect(existsRepoFile(".claude-pr/.claude/leak")).toBe(false);
+    // The escaping symlink itself must not survive into the restored tree either.
+    expect(existsRepoFile(".claude/leak")).toBe(false);
+  });
+
   test("does not modify an existing .gitignore", () => {
     writeRepoFile(".gitignore", "node_modules\n");
     git(["add", ".gitignore"]);

@@ -3,11 +3,16 @@ import {
   appendFileSync,
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
+  readlinkSync,
+  realpathSync,
   rmSync,
+  symlinkSync,
 } from "fs";
-import { dirname } from "path";
+import { dirname, isAbsolute, join, relative } from "path";
 
 // Paths that are both PR-controllable and read from cwd at CLI startup.
 //
@@ -30,19 +35,66 @@ const SENSITIVE_PATHS = [
 
 const CLAUDE_PR_EXCLUDE_PATTERN = "/.claude-pr/";
 
-function snapshotSensitivePath(src: string, dest: string): void {
+function isWithinRoot(root: string, target: string): boolean {
+  const rel = relative(root, target);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+// Recursively snapshots `src` into `dest`, dereferencing symlinks one level
+// at a time so every symlink in the tree (not just the top-level path) gets
+// its target checked before its content is copied.
+//
+// `cpSync(..., { dereference: true })` alone is unsafe here: the PR head is
+// attacker-controlled, so a symlink like `.claude/leak -> /etc/passwd` (or
+// `.claude -> /`) would have its *target's* content copied verbatim into the
+// repo working tree, where it becomes an ordinary file readable by every CLI
+// tool (Read/Glob/Grep) with no symlink-following involved anymore — turning
+// a contained repo checkout into an arbitrary host-filesystem read. Symlinks
+// that resolve outside the repository are skipped rather than dereferenced.
+function snapshotSensitivePath(
+  src: string,
+  dest: string,
+  repoRoot: string,
+): void {
+  let stat;
   try {
-    cpSync(src, dest, { recursive: true, dereference: true });
-  } catch (error) {
-    // Symlinks whose targets are absent on the PR head (e.g. `.claude/CLAUDE.md`
-    // -> `../AGENTS.md` when the PR deleted the target) make dereferenced
-    // copies throw ENOENT. Preserve the symlink for the review snapshot instead.
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-      cpSync(src, dest, { recursive: true });
+    stat = lstatSync(src);
+  } catch {
+    return;
+  }
+
+  if (stat.isSymbolicLink()) {
+    let real: string;
+    try {
+      real = realpathSync(src);
+    } catch {
+      // Target absent on the PR head (e.g. the PR deleted `../AGENTS.md`) or
+      // an unresolvable link (e.g. a loop) — preserve the symlink itself for
+      // the review snapshot rather than following it.
+      mkdirSync(dirname(dest), { recursive: true });
+      symlinkSync(readlinkSync(src), dest);
       return;
     }
-    throw error;
+    if (!isWithinRoot(repoRoot, real)) {
+      console.error(
+        `Refusing to snapshot ${src}: symlink target escapes the repository (-> ${real})`,
+      );
+      return;
+    }
+    snapshotSensitivePath(real, dest, repoRoot);
+    return;
   }
+
+  if (stat.isDirectory()) {
+    mkdirSync(dest, { recursive: true });
+    for (const entry of readdirSync(src)) {
+      snapshotSensitivePath(join(src, entry), join(dest, entry), repoRoot);
+    }
+    return;
+  }
+
+  mkdirSync(dirname(dest), { recursive: true });
+  cpSync(src, dest);
 }
 
 function ensureClaudePrExcludedFromGit(): void {
@@ -99,9 +151,10 @@ export function restoreConfigFromBase(baseBranch: string): void {
   // being executed. Captured before the security delete so it reflects the
   // PR-authored version.
   rmSync(".claude-pr", { recursive: true, force: true });
+  const repoRoot = realpathSync(process.cwd());
   for (const p of SENSITIVE_PATHS) {
     if (existsSync(p)) {
-      snapshotSensitivePath(p, `.claude-pr/${p}`);
+      snapshotSensitivePath(p, `.claude-pr/${p}`, repoRoot);
     }
   }
   if (existsSync(".claude-pr")) {
