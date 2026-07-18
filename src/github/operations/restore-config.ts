@@ -3,11 +3,15 @@ import {
   appendFileSync,
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
+  writeFileSync,
 } from "fs";
-import { dirname } from "path";
+import { dirname, join, sep } from "path";
 
 // Paths that are both PR-controllable and read from cwd at CLI startup.
 //
@@ -30,19 +34,49 @@ const SENSITIVE_PATHS = [
 
 const CLAUDE_PR_EXCLUDE_PATTERN = "/.claude-pr/";
 
-function snapshotSensitivePath(src: string, dest: string): void {
+function isEscapingSymlink(fullPath: string, root: string): boolean {
+  let real: string;
   try {
-    cpSync(src, dest, { recursive: true, dereference: true });
-  } catch (error) {
-    // Symlinks whose targets are absent on the PR head (e.g. `.claude/CLAUDE.md`
-    // -> `../AGENTS.md` when the PR deleted the target) make dereferenced
-    // copies throw ENOENT. Preserve the symlink for the review snapshot instead.
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-      cpSync(src, dest, { recursive: true });
-      return;
-    }
-    throw error;
+    real = realpathSync(fullPath);
+  } catch {
+    return false; // dangling target — resolves to nothing, not an escape
   }
+  return real !== root && !real.startsWith(root + sep);
+}
+
+// A PR can commit any sensitive path — or something nested inside one, e.g.
+// `.claude/settings.json` — as a symlink to an absolute path outside the
+// checkout: a runner secret/token file, /proc/self/environ, anything
+// readable by this process. Such a symlink must never be snapshotted, in
+// either direction: not dereferenced (that bakes the target's real bytes
+// into a regular file under .claude-pr/) and not preserved as a live symlink
+// either (that leaves something anything reading that exact path later —
+// including a review agent inspecting "what did this PR change" — would
+// transparently follow to the same secret). A stub note is the only safe
+// thing to leave behind for those; symlinks that resolve inside the
+// checkout, or are merely dangling (PR deleted the target), are harmless and
+// copied as-is.
+function snapshotSensitivePath(src: string, dest: string, root: string): void {
+  const st = lstatSync(src);
+
+  if (st.isSymbolicLink() && isEscapingSymlink(src, root)) {
+    mkdirSync(dirname(dest), { recursive: true });
+    writeFileSync(
+      dest,
+      "[snapshot omitted: this path is a symlink resolving outside the checkout]\n",
+    );
+    return;
+  }
+
+  if (st.isDirectory()) {
+    mkdirSync(dest, { recursive: true });
+    for (const entry of readdirSync(src)) {
+      snapshotSensitivePath(join(src, entry), join(dest, entry), root);
+    }
+    return;
+  }
+
+  cpSync(src, dest, { recursive: true });
 }
 
 function ensureClaudePrExcludedFromGit(): void {
@@ -99,9 +133,10 @@ export function restoreConfigFromBase(baseBranch: string): void {
   // being executed. Captured before the security delete so it reflects the
   // PR-authored version.
   rmSync(".claude-pr", { recursive: true, force: true });
+  const checkoutRoot = realpathSync(process.cwd());
   for (const p of SENSITIVE_PATHS) {
     if (existsSync(p)) {
-      snapshotSensitivePath(p, `.claude-pr/${p}`);
+      snapshotSensitivePath(p, `.claude-pr/${p}`, checkoutRoot);
     }
   }
   if (existsSync(".claude-pr")) {

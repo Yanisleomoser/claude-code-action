@@ -165,6 +165,77 @@ describe("restoreConfigFromBase", () => {
     );
   });
 
+  test("does not snapshot a PR-authored symlink pointing outside the checkout", () => {
+    const secretDir = mkdtempSync(join("/tmp", "runner-secret-"));
+    const secretFile = join(secretDir, "identity-token");
+    writeFileSync(secretFile, "super-secret-token-value\n");
+
+    git(["checkout", "pr"]);
+    rmSync(join(repoDir, ".mcp.json"), { force: true });
+    symlinkSync(secretFile, join(repoDir, ".mcp.json"));
+    git(["add", "-A"]);
+    git(["commit", "-m", "pr replaces .mcp.json with an escaping symlink"]);
+
+    restoreConfigFromBase("main");
+
+    // Neither dereferenced (which would bake the secret's bytes into a real
+    // file) nor preserved as a live symlink (which a later read of this exact
+    // path — including a review agent — would transparently follow to the
+    // same secret): a plain stub note is the only safe snapshot.
+    expect(lstatRepoFile(".claude-pr/.mcp.json").isSymbolicLink()).toBe(false);
+    expect(readRepoFile(".claude-pr/.mcp.json")).not.toContain(
+      "super-secret-token-value",
+    );
+    expect(existsRepoFile(".mcp.json")).toBe(false); // absent on base -> stays deleted
+
+    rmSync(secretDir, { recursive: true, force: true });
+  });
+
+  test("does not snapshot a PR-authored symlink replacing a whole sensitive directory", () => {
+    const secretDir = mkdtempSync(join("/tmp", "runner-secret-dir-"));
+    writeFileSync(join(secretDir, "leaked.txt"), "runner-only contents\n");
+
+    git(["checkout", "pr"]);
+    rmSync(join(repoDir, ".claude"), { recursive: true, force: true });
+    symlinkSync(secretDir, join(repoDir, ".claude"));
+    git(["add", "-A"]);
+    git(["commit", "-m", "pr replaces .claude with an escaping symlink"]);
+
+    restoreConfigFromBase("main");
+
+    expect(lstatRepoFile(".claude-pr/.claude").isSymbolicLink()).toBe(false);
+    expect(lstatRepoFile(".claude-pr/.claude").isDirectory()).toBe(false);
+    expect(existsRepoFile(".claude-pr/.claude/leaked.txt")).toBe(false);
+
+    rmSync(secretDir, { recursive: true, force: true });
+  });
+
+  test("still snapshots a nested symlink that escapes the checkout inside an otherwise-normal directory", () => {
+    const secretFile = mkdtempSync(join("/tmp", "runner-secret-nested-"));
+    const secretTokenFile = join(secretFile, "token");
+    writeFileSync(secretTokenFile, "nested-secret-value\n");
+
+    git(["checkout", "pr"]);
+    symlinkRepoFile(".claude/hooks.json", secretTokenFile);
+    git(["add", "-A"]);
+    git(["commit", "-m", "pr nests an escaping symlink inside .claude"]);
+
+    restoreConfigFromBase("main");
+
+    expect(
+      lstatRepoFile(".claude-pr/.claude/hooks.json").isSymbolicLink(),
+    ).toBe(false);
+    expect(readRepoFile(".claude-pr/.claude/hooks.json")).not.toContain(
+      "nested-secret-value",
+    );
+    // The rest of the directory is still snapshotted normally.
+    expect(readRepoFile(".claude-pr/.claude/settings.json")).toBe(
+      `${JSON.stringify({ source: "pr" })}\n`,
+    );
+
+    rmSync(secretFile, { recursive: true, force: true });
+  });
+
   test("does not modify an existing .gitignore", () => {
     writeRepoFile(".gitignore", "node_modules\n");
     git(["add", ".gitignore"]);
