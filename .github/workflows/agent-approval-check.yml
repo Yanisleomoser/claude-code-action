@@ -36,7 +36,12 @@ jobs:
     if: github.event_name != 'issue_comment' || github.event.issue.pull_request
     runs-on: ubuntu-latest
     steps:
-      - uses: anthropics/claude-code-action/agent-approval-check@main
+      # Pinned to a full-length SHA: this repo rejects tag/branch action refs
+      # ("all actions must be pinned to a full-length commit SHA"), so @main
+      # or @v1 fails at action-resolution time before any step runs. This is
+      # this repo's own copy of the action, at the current main. Bump the SHA
+      # to pick up changes to agent-approval-check/.
+      - uses: Yanisleomoser/claude-code-action/agent-approval-check@e8fb0d80642143db8f1261e9a62781862efe72d2
         with:
           required_approvals: 1
           # Claude Code commits land with this committer email; the check
